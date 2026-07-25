@@ -6,6 +6,10 @@
 [![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://www.swift.org/)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+<p align="center">
+  <img width="180" height="180" alt="Codex Usage Widget 效果图" src="https://github.com/user-attachments/assets/5717a00a-b2dd-4b8b-bb94-caed1343ce83">
+</p>
+
 Codex Usage Widget 是一个真正的 macOS WidgetKit 小组件，用来显示 Codex
 当前额度的已用比例、剩余比例和重置时间。它不需要 API Key，不读取
 `auth.json`，也不会把任何数据发送到第三方服务器。
