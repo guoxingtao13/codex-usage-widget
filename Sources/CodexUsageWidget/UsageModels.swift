@@ -6,18 +6,11 @@ struct LimitWindow: Equatable, Sendable {
   let resetsAt: Date
 
   var remainingPercent: Double {
-    remainingPercent(at: Date())
-  }
-
-  func remainingPercent(at date: Date) -> Double {
-    if resetsAt <= date {
-      return 100
-    }
     return max(0, min(100, 100 - usedPercent))
   }
 
-  func effectiveUsedPercent(at date: Date) -> Double {
-    100 - remainingPercent(at: date)
+  func isCurrent(at date: Date) -> Bool {
+    resetsAt > date
   }
 
   var displayName: String {
@@ -41,6 +34,8 @@ struct LimitWindow: Equatable, Sendable {
 }
 
 struct UsageSnapshot: Equatable, Sendable {
+  static let maximumAge: TimeInterval = 15 * 60
+
   let timestamp: Date
   let primary: LimitWindow?
   let secondary: LimitWindow?
@@ -57,6 +52,13 @@ struct UsageSnapshot: Equatable, Sendable {
 
   var mostConstrainedLimit: LimitWindow? {
     limits.min { $0.remainingPercent < $1.remainingPercent }
+  }
+
+  func isFresh(at date: Date) -> Bool {
+    !limits.isEmpty
+      && timestamp <= date.addingTimeInterval(60)
+      && date.timeIntervalSince(timestamp) <= Self.maximumAge
+      && limits.allSatisfy { $0.isCurrent(at: date) }
   }
 }
 

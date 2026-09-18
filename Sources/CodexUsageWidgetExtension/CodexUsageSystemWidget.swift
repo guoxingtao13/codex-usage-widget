@@ -6,6 +6,8 @@ private enum WidgetConstants {
   static let kind = "CodexUsageSystemWidget"
   static let endpoint = URL(string: "http://127.0.0.1:49671/snapshot")!
   static let accent = Color(red: 0.24, green: 0.92, blue: 0.34)
+  static let maximumSnapshotAge: TimeInterval = 15 * 60
+  static let timelineRefreshInterval: TimeInterval = 5 * 60
 }
 
 private struct WidgetLimit: Codable, Equatable {
@@ -14,9 +16,6 @@ private struct WidgetLimit: Codable, Equatable {
   let resetsAt: TimeInterval
 
   var remainingPercent: Double {
-    if resetsAt <= Date().timeIntervalSince1970 {
-      return 100
-    }
     return max(0, min(100, 100 - usedPercent))
   }
 
@@ -40,8 +39,21 @@ private struct WidgetLimit: Codable, Equatable {
 
 private struct WidgetPayload: Codable, Equatable {
   let generatedAt: TimeInterval
+  let sourceAt: TimeInterval
   let limits: [WidgetLimit]
   let creditsBalance: String?
+
+  var validUntil: Date {
+    let sourceExpiry = sourceAt + WidgetConstants.maximumSnapshotAge
+    let firstReset = limits.map(\.resetsAt).min() ?? sourceExpiry
+    return Date(timeIntervalSince1970: min(sourceExpiry, firstReset))
+  }
+
+  func isFresh(at date: Date) -> Bool {
+    !limits.isEmpty
+      && sourceAt <= date.addingTimeInterval(60).timeIntervalSince1970
+      && date < validUntil
+  }
 
   var sortedLimits: [WidgetLimit] {
     limits.sorted { $0.windowMinutes < $1.windowMinutes }
@@ -55,6 +67,7 @@ private struct WidgetPayload: Codable, Equatable {
 private struct UsageEntry: TimelineEntry {
   let date: Date
   let payload: WidgetPayload?
+  let isStale: Bool
 }
 
 private struct UsageProvider: TimelineProvider {
@@ -63,6 +76,7 @@ private struct UsageProvider: TimelineProvider {
       date: Date(),
       payload: WidgetPayload(
         generatedAt: Date().timeIntervalSince1970,
+        sourceAt: Date().timeIntervalSince1970,
         limits: [
           WidgetLimit(
             usedPercent: 24,
@@ -71,7 +85,8 @@ private struct UsageProvider: TimelineProvider {
           )
         ],
         creditsBalance: nil
-      )
+      ),
+      isStale: false
     )
   }
 
@@ -85,10 +100,14 @@ private struct UsageProvider: TimelineProvider {
 
   func getTimeline(in context: Context, completion: @escaping (Timeline<UsageEntry>) -> Void) {
     fetchEntry { entry in
-      let nextRefresh =
-        Calendar.current.date(byAdding: .minute, value: 1, to: Date())
-        ?? Date().addingTimeInterval(60)
-      completion(Timeline(entries: [entry], policy: .after(nextRefresh)))
+      let nextRefresh = entry.date.addingTimeInterval(WidgetConstants.timelineRefreshInterval)
+      var entries = [entry]
+      if let payload = entry.payload, !entry.isStale {
+        entries.append(
+          UsageEntry(date: payload.validUntil, payload: payload, isStale: true)
+        )
+      }
+      completion(Timeline(entries: entries, policy: .after(nextRefresh)))
     }
   }
 
@@ -108,7 +127,14 @@ private struct UsageProvider: TimelineProvider {
       } else {
         payload = nil
       }
-      completion(UsageEntry(date: Date(), payload: payload))
+      let now = Date()
+      completion(
+        UsageEntry(
+          date: now,
+          payload: payload,
+          isStale: payload.map { !$0.isFresh(at: now) } ?? false
+        )
+      )
     }.resume()
   }
 }
@@ -135,15 +161,24 @@ private struct CodexUsageWidgetView: View {
 
   var body: some View {
     Group {
-      if let payload = entry.payload, let headline = payload.headline {
+      if let payload = entry.payload, entry.isStale {
+        WaitingView(
+          title: "数据已过期",
+          detail: "最后更新 \(updatedTime(payload.sourceAt))"
+        )
+      } else if let payload = entry.payload, let headline = payload.headline {
         switch family {
         case .systemMedium:
           MediumUsageView(payload: payload, headline: headline, entryDate: entry.date)
         default:
-          SmallUsageView(headline: headline, entryDate: entry.date)
+          SmallUsageView(
+            headline: headline,
+            entryDate: entry.date,
+            sourceAt: payload.sourceAt
+          )
         }
       } else {
-        WaitingView()
+        WaitingView(title: "数据暂不可用", detail: "可能已过期，等待后台更新")
       }
     }
     .padding(family == .systemMedium ? 16 : 14)
@@ -155,6 +190,7 @@ private struct CodexUsageWidgetView: View {
 private struct SmallUsageView: View {
   let headline: WidgetLimit
   let entryDate: Date
+  let sourceAt: TimeInterval
 
   var body: some View {
     VStack(alignment: .leading, spacing: 7) {
@@ -178,6 +214,10 @@ private struct SmallUsageView: View {
         }
       }
       .frame(maxHeight: .infinity)
+
+      Text("更新于 \(updatedTime(sourceAt))")
+        .font(.system(size: 9, weight: .semibold, design: .rounded))
+        .foregroundStyle(.white.opacity(0.72))
     }
   }
 }
@@ -211,6 +251,10 @@ private struct MediumUsageView: View {
             .font(.system(size: 10, weight: .bold, design: .rounded))
             .foregroundStyle(.white.opacity(0.76))
         }
+
+        Text("更新于 \(updatedTime(payload.sourceAt))")
+          .font(.system(size: 10, weight: .semibold, design: .rounded))
+          .foregroundStyle(.white.opacity(0.72))
       }
       .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -306,6 +350,9 @@ private struct LimitBar: View {
 }
 
 private struct WaitingView: View {
+  let title: String
+  let detail: String
+
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
       WidgetHeader()
@@ -313,14 +360,22 @@ private struct WaitingView: View {
       Image(systemName: "arrow.triangle.2.circlepath")
         .font(.system(size: 26, weight: .medium))
         .foregroundStyle(WidgetConstants.accent)
-      Text("等待 Codex 数据")
+      Text(title)
         .font(.system(size: 14, weight: .bold, design: .rounded))
-      Text("后台助手启动后自动更新")
+      Text(detail)
         .font(.system(size: 10, weight: .medium, design: .rounded))
         .foregroundStyle(.white.opacity(0.7))
       Spacer()
     }
   }
+}
+
+private func updatedTime(_ timestamp: TimeInterval) -> String {
+  let date = Date(timeIntervalSince1970: timestamp)
+  if Calendar.current.isDateInToday(date) {
+    return date.formatted(date: .omitted, time: .shortened)
+  }
+  return date.formatted(date: .abbreviated, time: .shortened)
 }
 
 private func resetText(for limit: WidgetLimit, now: Date) -> String {

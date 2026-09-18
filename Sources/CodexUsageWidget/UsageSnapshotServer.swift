@@ -7,7 +7,7 @@ struct WidgetLimitPayload: Codable, Equatable, Sendable {
   let resetsAt: TimeInterval
 
   init(_ limit: LimitWindow) {
-    usedPercent = limit.effectiveUsedPercent(at: Date())
+    usedPercent = max(0, min(100, limit.usedPercent))
     windowMinutes = limit.windowMinutes
     resetsAt = limit.resetsAt.timeIntervalSince1970
   }
@@ -15,11 +15,13 @@ struct WidgetLimitPayload: Codable, Equatable, Sendable {
 
 struct WidgetUsagePayload: Codable, Equatable, Sendable {
   let generatedAt: TimeInterval
+  let sourceAt: TimeInterval
   let limits: [WidgetLimitPayload]
   let creditsBalance: String?
 
   init(_ snapshot: UsageSnapshot) {
     generatedAt = Date().timeIntervalSince1970
+    sourceAt = snapshot.timestamp.timeIntervalSince1970
     limits = snapshot.limits.map(WidgetLimitPayload.init)
     creditsBalance = snapshot.creditsBalance
   }
@@ -29,8 +31,11 @@ final class UsageSnapshotServer: @unchecked Sendable {
   private let queue = DispatchQueue(label: "local.codex.usage-widget.snapshot-server")
   private let lock = NSLock()
   private let encoder = JSONEncoder()
+  private let maximumConcurrentConnections = 16
+  private let requestTimeout: DispatchTimeInterval = .seconds(5)
   private var listener: NWListener?
   private var payloadData: Data?
+  private var activeConnections: [ObjectIdentifier: NWConnection] = [:]
 
   func start() {
     guard listener == nil else {
@@ -39,7 +44,12 @@ final class UsageSnapshotServer: @unchecked Sendable {
 
     do {
       let port = try NWEndpoint.Port(rawValue: WidgetConfiguration.serverPort).unwrap()
-      let listener = try NWListener(using: .tcp, on: port)
+      let parameters = NWParameters.tcp
+      parameters.requiredLocalEndpoint = .hostPort(
+        host: NWEndpoint.Host("127.0.0.1"),
+        port: port
+      )
+      let listener = try NWListener(using: parameters)
       listener.newConnectionHandler = { [weak self] connection in
         self?.handle(connection)
       }
@@ -58,6 +68,14 @@ final class UsageSnapshotServer: @unchecked Sendable {
   func stop() {
     listener?.cancel()
     listener = nil
+    queue.async { [weak self] in
+      guard let self else {
+        return
+      }
+      for identifier in Array(activeConnections.keys) {
+        finishConnection(identifier)
+      }
+    }
   }
 
   func update(_ snapshot: UsageSnapshot) {
@@ -70,12 +88,42 @@ final class UsageSnapshotServer: @unchecked Sendable {
     lock.unlock()
   }
 
+  func clear() {
+    lock.lock()
+    payloadData = nil
+    lock.unlock()
+  }
+
   private func handle(_ connection: NWConnection) {
+    guard activeConnections.count < maximumConcurrentConnections else {
+      connection.cancel()
+      return
+    }
+
+    let identifier = ObjectIdentifier(connection)
+    activeConnections[identifier] = connection
+    connection.stateUpdateHandler = { [weak self] state in
+      switch state {
+      case .failed, .cancelled:
+        self?.finishConnection(identifier)
+      default:
+        break
+      }
+    }
     connection.start(queue: queue)
+
+    queue.asyncAfter(deadline: .now() + requestTimeout) { [weak self] in
+      self?.finishConnection(identifier)
+    }
+
     connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) {
-      [weak self] _, _, _, _ in
+      [weak self] data, _, _, error in
       guard let self else {
-        connection.cancel()
+        return
+      }
+
+      guard error == nil, data?.isEmpty == false else {
+        finishConnection(identifier)
         return
       }
 
@@ -84,13 +132,22 @@ final class UsageSnapshotServer: @unchecked Sendable {
         content: response,
         contentContext: .finalMessage,
         isComplete: true,
-        completion: .contentProcessed { error in
+        completion: .contentProcessed { [weak self] error in
           if let error {
             NSLog("CodexUsageWidget snapshot send failed: \(error)")
           }
+          self?.finishConnection(identifier)
         }
       )
     }
+  }
+
+  private func finishConnection(_ identifier: ObjectIdentifier) {
+    guard let connection = activeConnections.removeValue(forKey: identifier) else {
+      return
+    }
+    connection.stateUpdateHandler = nil
+    connection.cancel()
   }
 
   private func makeResponse() -> Data {

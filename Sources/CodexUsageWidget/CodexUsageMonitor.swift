@@ -5,7 +5,6 @@ actor CodexUsageScanner {
   private let maximumFileBytes: UInt64 = 4 * 1_024 * 1_024
   private let maximumCandidateFiles = 20
   private var cache: [URL: CachedSnapshot] = [:]
-  private var newestKnownSnapshot: UsageSnapshot?
 
   func latestSnapshot() -> UsageSnapshot? {
     let candidates = recentSessionDirectories()
@@ -24,6 +23,9 @@ actor CodexUsageScanner {
         continue
       }
 
+      // A changed or unreadable file must not keep its old snapshot alive.
+      cache.removeValue(forKey: candidate.url)
+
       guard let data = readTail(of: candidate.url),
         let snapshot = UsageLogParser.latestSnapshot(
           in: data,
@@ -38,13 +40,13 @@ actor CodexUsageScanner {
         modificationDate: candidate.modificationDate,
         snapshot: snapshot
       )
-
-      if newestKnownSnapshot == nil || snapshot.timestamp > newestKnownSnapshot!.timestamp {
-        newestKnownSnapshot = snapshot
-      }
     }
 
-    return newestKnownSnapshot
+    let now = Date()
+    return cache.values
+      .map(\.snapshot)
+      .filter { $0.isFresh(at: now) }
+      .max { $0.timestamp < $1.timestamp }
   }
 
   private func recentSessionDirectories() -> [URL] {
