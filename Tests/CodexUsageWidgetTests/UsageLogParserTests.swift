@@ -61,14 +61,42 @@ struct UsageLogParserTests {
   }
 
   @Test
-  func treatsExpiredWindowAsFullyReset() {
+  func doesNotInventAResetForExpiredData() {
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
     let limit = LimitWindow(
       usedPercent: 87,
       windowMinutes: 300,
-      resetsAt: Date().addingTimeInterval(-60)
+      resetsAt: now.addingTimeInterval(-60)
     )
 
-    #expect(limit.remainingPercent == 100)
-    #expect(limit.effectiveUsedPercent(at: Date()) == 0)
+    #expect(limit.remainingPercent == 13)
+    #expect(!limit.isCurrent(at: now))
+  }
+
+  @Test
+  func rejectsOldOrExpiredSnapshots() {
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
+    let limit = LimitWindow(
+      usedPercent: 45,
+      windowMinutes: 10_080,
+      resetsAt: now.addingTimeInterval(3_600)
+    )
+    let fresh = UsageSnapshot(
+      timestamp: now.addingTimeInterval(-60),
+      primary: limit,
+      secondary: nil,
+      creditsBalance: nil,
+      hasCredits: nil,
+      planType: nil,
+      sourcePath: "/tmp/sample.jsonl"
+    )
+
+    #expect(fresh.isFresh(at: now))
+    #expect(!fresh.isFresh(at: now.addingTimeInterval(UsageSnapshot.maximumAge)))
+    #expect(!fresh.isFresh(at: now.addingTimeInterval(3_600)))
+
+    let payload = WidgetUsagePayload(fresh)
+    #expect(payload.sourceAt == fresh.timestamp.timeIntervalSince1970)
+    #expect(payload.limits.first?.usedPercent == 45)
   }
 }
